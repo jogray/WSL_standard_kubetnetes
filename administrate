@@ -1,0 +1,4 @@
+#!/bin/env bash
+sudo systemctl start containerd kubelet # 启动集群服务
+sudo systemctl stop kubelet containerd # 停止集群服务
+sudo kubeadm reset -f         # 重置集群配置

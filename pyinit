@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""
+init.py - 用 Python 重写等效的 init bash 脚本
+
+说明:
+- 尽可能使用 Python 标准库实现下载、sha256 校验、解压、文件写入与文本替换。
+- 仍然会通过 subprocess 调用系统级命令（如 `dnf`, `systemctl`, `kubeadm`），因为这些不是标准库能替代的系统包管理/服务管理操作。
+- 请以 root 身份运行此脚本: `sudo python3 /home/k8s/stdk/init.py`
+"""
+import logging
+from pathlib import Path
+import platform
+import urllib.request
+import tempfile
+import tarfile
+import sys
+import subprocess
+import shutil
+import os
+import hashlib
+
+proxy = 'http://myhost:myport'
+no_proxy = '\'192.168.0.0/16,172.16.0.0/12,10.0.0.0/8,127.0.0.0/8,localhost,<local>\''
+runc_sha256 = '8781ab9f71c12f314d21c8e85f13ca1a82d90cf475aa5131a7b543fcc5487543'
+CRICTL_VERSION = 'v1.34.0'
+KUBER_DIR = '/bin'
+ARCH = 'amd64'
+workdir = Path.cwd()
+
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({
+    'http': proxy,
+    'https': proxy
+}))
+urllib.request.install_opener(opener)    # 全局生效
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def has_glibc() -> bool:
+    """Return True if the system libc appears to be glibc.
+
+    We try a few heuristics:
+    - platform.libc_ver()
+    - output of `ldd --version`
+    """
+    try:
+        name, ver = platform.libc_ver()
+        combined = f"{name} {ver}".lower()
+        if 'glibc' in combined or 'gnu libc' in combined:
+            return True
+    except Exception:
+        pass
+    try:
+        out = subprocess.check_output(
+            ['ldd', '--version'], stderr=subprocess.STDOUT, text=True)
+        if 'glibc' in out.lower() or 'gnu libc' in out.lower():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def run(cmd, check=True, **kwargs):
+    message = " ".join(cmd) if isinstance(cmd, (list, tuple)) else str(cmd)
+    logger.info("RUN: %s", message)
+    return subprocess.run(cmd, check=check, **kwargs)
+
+
+def download(url: str, dest_path: str, show_progress=False, mode='wb'):
+    dest_path = Path(dest_path)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    logger.info("Downloading %s -> %s", url.split('/')[-1], dest_path)
+    with urllib.request.urlopen(url) as resp, open(dest_path, mode) as out:
+        shutil.copyfileobj(resp, out)
+    return dest_path
+
+
+def download_text(url):
+    with urllib.request.urlopen(url) as resp:
+        return resp.read().decode('utf-8')
+
+
+def sha256_of_file(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def sha_check(path, sha: Path | str = None):
+    filesha = sha256_of_file(path)
+    if sha is None:
+        return True
+    if isinstance(sha, Path):
+        with open(sha, 'r') as f:
+            sha256 = f.read()
+            return sha256.startswith(filesha)
+    elif isinstance(sha, str):
+        return filesha.startswith(sha)
+    return False
+
+
+def extract_tar_gz(archive_path, dest_dir):
+    logger.info("Extract %s -> %s", archive_path, dest_dir)
+    with tarfile.open(archive_path, 'r:gz') as t:
+        t.extractall(path=dest_dir)
+
+
+def write_file(path, content, mode=0o644):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    os.chmod(path, mode)
+    logger.info("Wrote %s", path)
+
+
+def download_cache(item):
+    sha = item['hash']
+    sha_path = workdir / (item['path'].name + '.sha256')
+    if isinstance(item['hash'], str) and '://' in item['hash'][:16]:
+        download(item['hash'], sha_path)
+        sha = sha_path
+    if item['path'].exists() and sha_check(item['path'], sha):
+        logger.info('Using cached %s', item['path'].name)
+    else:
+        download(item['url'], item['path'])
+    if not sha_check(item['path'], sha):
+        logger.error('SHA256 check failed for %s', item['path'])
+        sys.exit(1)
+    return item['path']
+
+
+def main():
+    if os.geteuid() != 0:
+        logger.error("This script must be run as root. Use sudo.")
+        sys.exit(1)
+
+    # 检查是否为 glibc；若不是则拒绝执行
+    if not has_glibc():
+        logger.error(
+            'glibc not detected on this system. This script requires glibc; aborting.')
+        sys.exit(1)
+
+    # 获取 RELEASE (使用 python 标准库替代 curl)
+    proxis = urllib.request.getproxies()
+    scheme = urllib.parse
+
+    RELEASE = download_text('https://dl.k8s.io/release/stable.txt').strip()
+    logger.info('Kubernetes release: %s', RELEASE)
+
+    # 导出代理到 /etc/profile.d
+    profile_sh = (Path('/etc/profile.d') / 'proxy.sh')
+    profile_content = (
+        f"export HTTP_PROXY={proxy}\n"
+        f"export HTTPS_PROXY={proxy}\n"
+        f"export NO_PROXY={no_proxy}\n"
+    )
+    write_file(profile_sh, profile_content, mode=0o644)
+    os.environ['HTTP_PROXY'] = proxy
+    os.environ['HTTPS_PROXY'] = proxy
+    os.environ['NO_PROXY'] = no_proxy
+
+    # 下载所需文件
+    containerd = {
+        'path': workdir / 'containerd-2.2.0-linux-amd64.tar.gz',
+        'url': 'https://github.com/containerd/containerd/releases/download/v2.2.0/containerd-2.2.0-linux-amd64.tar.gz',
+        'hash': 'https://github.com/containerd/containerd/releases/download/v2.2.0/containerd-2.2.0-linux-amd64.tar.gz.sha256sum'
+    }
+    runc = {
+        'path': workdir / 'runc.amd64',
+        'url': 'https://github.com/opencontainers/runc/releases/download/v1.3.3/runc.amd64',
+        'hash': runc_sha256
+    }
+    cni = {
+        'path': workdir / 'cni-plugins-linux-amd64-v1.8.0.tgz',
+        'url': 'https://github.com/containernetworking/plugins/releases/download/v1.8.0/cni-plugins-linux-amd64-v1.8.0.tgz',
+        'hash': 'https://github.com/containernetworking/plugins/releases/download/v1.8.0/cni-plugins-linux-amd64-v1.8.0.tgz.sha256'
+    }
+    crictl = {
+        'path': workdir / f'crictl-{CRICTL_VERSION}-linux-amd64.tar.gz',
+        'url': None, 'hash': None}
+    crictl['url'] = f'https://github.com/kubernetes-sigs/cri-tools/releases/download/{CRICTL_VERSION}/{crictl["path"].name}'
+    crictl['hash'] = f'https://github.com/kubernetes-sigs/cri-tools/releases/download/{CRICTL_VERSION}/{crictl["path"].name}.sha256'
+
+    download_cache(containerd)
+    download_cache(runc)
+    download_cache(cni)
+    download_cache(crictl)
+
+    # 安装 containerd (解压到 /usr/local)
+    if containerd['path'].exists():
+        extract_tar_gz(containerd['path'], '/usr/local')
+
+    # 安装 runc
+    if runc['path'].exists():
+        shutil.copy2(runc['path'], '/usr/local/bin/runc')
+        os.chmod('/usr/local/bin/runc', 0o755)
+
+    # 安装 CNI 插件
+    if cni['path'].exists():
+        dest = Path('/opt/cni/bin')
+        dest.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(cni['path'], 'r:gz') as t:
+            t.extractall(path=str(dest))
+
+    # 安装 crictl
+    if crictl['path'].exists():
+        with tarfile.open(crictl['path'], 'r:gz') as t:
+            t.extractall(path='/usr/local/bin')
+
+    # sysctl 设置
+    write_file('/etc/sysctl.d/k8s.conf',
+               'net.ipv4.ip_forward = 1\n', mode=0o644)
+    try:
+        run(['sysctl', '--system'])
+    except subprocess.CalledProcessError:
+        logger.warning('Warning: sysctl --system failed')
+
+    # 准备 kubernetes 二进制目录并下载 kubeadm/kubelet
+    Path(KUBER_DIR).mkdir(parents=True, exist_ok=True)
+    # 下载 kubeadm 与 kubelet
+    kubeadm_url = f'https://dl.k8s.io/release/{RELEASE}/bin/linux/{ARCH}/kubeadm'
+    kubelet_url = f'https://dl.k8s.io/release/{RELEASE}/bin/linux/{ARCH}/kubelet'
+    kubectl_url = f'https://dl.k8s.io/release/{RELEASE}/bin/linux/{ARCH}/kubectl'
+    download(kubeadm_url, Path(KUBER_DIR) / 'kubeadm')
+    download(kubelet_url, Path(KUBER_DIR) / 'kubelet')
+    download(kubectl_url, Path(KUBER_DIR) / 'kubectl')
+    os.chmod(Path(KUBER_DIR) / 'kubeadm', 0o755)
+    os.chmod(Path(KUBER_DIR) / 'kubelet', 0o755)
+    os.chmod(Path(KUBER_DIR) / 'kubectl', 0o755)
+
+    # 下载并写入 kubelet systemd 单元与 kubeadm conf (替代 curl | sed | tee)
+    KUBERNETES_VERSION = 'v0.16.2'
+    kubelet_service_url = (
+        f'https://raw.githubusercontent.com/kubernetes/release/{KUBERNETES_VERSION}/cmd/krel/templates/latest/kubelet/kubelet.service'
+    )
+    kubeadm_conf_url = (
+        f'https://raw.githubusercontent.com/kubernetes/release/{KUBERNETES_VERSION}/cmd/krel/templates/latest/kubeadm/10-kubeadm.conf'
+    )
+    kubelet_service_text = download_text(
+        kubelet_service_url).replace('/usr/bin', KUBER_DIR)
+    write_file('/usr/lib/systemd/system/kubelet.service',
+               kubelet_service_text, mode=0o644)
+    Path('/usr/lib/systemd/system/kubelet.service.d').mkdir(parents=True, exist_ok=True)
+    kubeadm_conf_text = download_text(
+        kubeadm_conf_url).replace('/usr/bin', KUBER_DIR)
+    write_file('/usr/lib/systemd/system/kubelet.service.d/10-kubeadm.conf',
+               kubeadm_conf_text, mode=0o644)
+
+    # 下载 containerd.service 并移动
+    containerd_service_url = 'https://raw.githubusercontent.com/containerd/containerd/main/containerd.service'
+    download(containerd_service_url, workdir / 'containerd.service')
+    shutil.move(str(workdir / 'containerd.service'),
+                '/etc/systemd/system/containerd.service')
+
+    # 写入 containerd http-proxy 配置
+    proxy_conf = (
+        '[Service]\n'
+        f'Environment="HTTP_PROXY={proxy}"\n'
+        f'Environment="HTTPS_PROXY={proxy}"\n'
+        f'Environment="NO_PROXY={no_proxy}"\n'
+    )
+    Path('/etc/systemd/system/containerd.service.d').mkdir(parents=True, exist_ok=True)
+    write_file('/etc/systemd/system/containerd.service.d/http-proxy.conf',
+               proxy_conf, mode=0o644)
+
+    # systemd reload + enable containerd
+    try:
+        run(['systemctl', 'daemon-reload'])
+        run(['systemctl', 'enable', '--now', 'containerd'])
+    except subprocess.CalledProcessError:
+        logger.warning(
+            'Warning: failed to enable/start containerd via systemctl')
+
+    # 配置 crictl
+    crictl_yaml = (
+        'runtime-endpoint: unix:///var/run/containerd/containerd.sock\n'
+        'image-endpoint: unix:///var/run/containerd/containerd.sock\n'
+        'timeout: 10\n'
+        'debug: false\n'
+    )
+    write_file('/etc/crictl.yaml', crictl_yaml, mode=0o644)
+
+    # 调用 kubeadm init（保留为系统命令）
+    try:
+        run(['systemctl', 'enable', '--now', 'kubelet'])
+        run(['kubeadm', 'init'])
+    except subprocess.CalledProcessError:
+        logger.warning(
+            'Warning: kubeadm init failed or requires manual intervention')
+
+    # kubectl 配置
+    try:
+        Path('/root/.kube').mkdir(parents=True, exist_ok=True)
+        if Path('/etc/kubernetes/admin.conf').exists():
+            shutil.copy2('/etc/kubernetes/admin.conf', '/root/.kube/config')
+            os.chown('/root/.kube/config', 0, 0)
+            os.chmod('/root/.kube/config', 0o600)
+            run(['kubectl', 'cluster-info'], check=False)
+    except Exception as e:
+        logger.warning('Warning: kubectl config step: %s', e)
+
+    logger.info('init.py finished. 请检查日志并在非生产环境中验证。')
+
+
+if __name__ == '__main__':
+    main()
