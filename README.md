@@ -5,7 +5,7 @@
 
 
 #### 启动之前
-确保你的wsl是在mirrored网路模式启动，并开启了`已启用自动代理`选项
+确保你的wsl是在mirrored网络模式启动，并开启了`已启用自动代理`选项
 1. 首先更新WSL版本，在这之前请务必保存wsl内的所有工作，并使用`wsl --shutdown`退出WSL
 2. 而后按win，在WSL settings将WSL的网络改为mirrored，打开`已启用自动代理`选项
     ```
